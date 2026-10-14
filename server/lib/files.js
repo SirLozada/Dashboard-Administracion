@@ -8,6 +8,11 @@ import { badRequest, configError } from './errors.js';
 import { maxUploadMb } from './settings.js';
 
 // Almacenamiento de adjuntos: Vercel Blob (privado) si hay token; si no, disco local en DATA_DIR/uploads.
+// El token puede venir con prefijo (p. ej. STORAGE_BLOB_READ_WRITE_TOKEN) si así lo creó Vercel.
+if (!process.env.BLOB_READ_WRITE_TOKEN) {
+  const key = Object.keys(process.env).find((k) => /BLOB_READ_WRITE_TOKEN$/.test(k) && process.env[k]);
+  if (key) process.env.BLOB_READ_WRITE_TOKEN = process.env[key];
+}
 const USE_BLOB = !!process.env.BLOB_READ_WRITE_TOKEN;
 const BLOB_ACCESS = process.env.BLOB_ACCESS === 'public' ? 'public' : 'private';
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');

@@ -9,7 +9,10 @@ import { configError } from './errors.js';
 // - Local y pruebas: PGlite (Postgres embebido) persistido en DATA_DIR/pgdata, sin instalar nada.
 
 export const DATA_DIR = path.resolve(process.env.DATA_DIR || 'data');
-const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL;
+// Vercel puede crear la variable con un prefijo (p. ej. STORAGE_DATABASE_URL); se acepta cualquiera.
+const envByPattern = (re) => Object.keys(process.env).sort().filter((k) => re.test(k)).map((k) => process.env[k]).find(Boolean);
+const DATABASE_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL
+  || envByPattern(/_DATABASE_URL$/) || envByPattern(/_POSTGRES_URL$/);
 
 const als = new AsyncLocalStorage();
 let driver;
