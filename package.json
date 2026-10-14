@@ -1,0 +1,35 @@
+{
+  "name": "herbaplant-gestion-administrativa",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Laboratorios Herbaplant — Sistema de Gestión Administrativa (Fase 1: Requisiciones)",
+  "type": "module",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c green,blue \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "node --watch server/index.js",
+    "dev:client": "vite --config client/vite.config.js",
+    "build": "vite build --config client/vite.config.js",
+    "start": "NODE_ENV=production node server/index.js",
+    "seed:demo": "node server/scripts/seed-demo.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.3.0",
+    "helmet": "^8.3.0",
+    "multer": "^2.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-router-dom": "^7.18.4",
+    "vite": "^8.3.4"
+  }
+}

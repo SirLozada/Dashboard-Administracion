@@ -1,0 +1,277 @@
+// Migraciones secuenciales. Nunca modificar una migración ya publicada: agregar una nueva.
+export const MIGRATIONS = [
+  /* v1 — núcleo + módulo de requisiciones */ `
+  CREATE TABLE departments (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    position TEXT NOT NULL DEFAULT '',
+    department_id INTEGER REFERENCES departments(id),
+    role TEXT NOT NULL CHECK (role IN ('solicitante','compras','administracion','superadmin')),
+    active INTEGER NOT NULL DEFAULT 1,
+    password_hash TEXT NOT NULL,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    last_login_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    ip TEXT,
+    user_agent TEXT
+  );
+  CREATE INDEX idx_sessions_user ON sessions(user_id);
+
+  CREATE TABLE role_permissions (
+    role TEXT NOT NULL,
+    permission TEXT NOT NULL,
+    PRIMARY KEY (role, permission)
+  );
+
+  CREATE TABLE user_permissions (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    permission TEXT NOT NULL,
+    PRIMARY KEY (user_id, permission)
+  );
+
+  CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
+  CREATE TABLE counters (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+  );
+
+  CREATE TABLE audit_log (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    action TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    entity_id INTEGER,
+    details TEXT,
+    ip TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_audit_created ON audit_log(created_at);
+
+  CREATE TABLE notifications (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    link TEXT,
+    read_at TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_notifications_user ON notifications(user_id, read_at);
+
+  CREATE TABLE categories (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    description TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE units (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    abbreviation TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE articles (
+    id INTEGER PRIMARY KEY,
+    code TEXT UNIQUE COLLATE NOCASE,
+    name TEXT NOT NULL,
+    category_id INTEGER NOT NULL REFERENCES categories(id),
+    unit_id INTEGER REFERENCES units(id),
+    description TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (name, category_id)
+  );
+
+  CREATE TABLE suppliers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    tax_id TEXT NOT NULL DEFAULT '',
+    contact_name TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE files (
+    id INTEGER PRIMARY KEY,
+    uuid TEXT NOT NULL UNIQUE,
+    requisition_id INTEGER REFERENCES requisitions(id),
+    kind TEXT NOT NULL CHECK (kind IN ('referencia','cotizacion','factura','comprobante')),
+    original_name TEXT NOT NULL,
+    stored_name TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    uploaded_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE requisitions (
+    id INTEGER PRIMARY KEY,
+    number TEXT NOT NULL UNIQUE,
+    client_token TEXT UNIQUE,
+    requester_id INTEGER NOT NULL REFERENCES users(id),
+    department_id INTEGER NOT NULL REFERENCES departments(id),
+    required_date TEXT,
+    priority TEXT NOT NULL CHECK (priority IN ('normal','alta','urgente')),
+    justification TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    currency TEXT,
+    purchasing_notes TEXT NOT NULL DEFAULT '',
+    submitted_at TEXT,
+    received_by INTEGER REFERENCES users(id),
+    received_at TEXT,
+    reviewed_by INTEGER REFERENCES users(id),
+    reviewed_at TEXT,
+    decided_by INTEGER REFERENCES users(id),
+    decided_at TEXT,
+    decision_notes TEXT NOT NULL DEFAULT '',
+    approved_total REAL,
+    purchase_completed INTEGER NOT NULL DEFAULT 0,
+    closed_by INTEGER REFERENCES users(id),
+    closed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_req_status ON requisitions(status);
+  CREATE INDEX idx_req_department ON requisitions(department_id);
+
+  CREATE TABLE requisition_items (
+    id INTEGER PRIMARY KEY,
+    requisition_id INTEGER NOT NULL REFERENCES requisitions(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    article_id INTEGER REFERENCES articles(id),
+    category_id INTEGER REFERENCES categories(id),
+    item_name TEXT NOT NULL,
+    category_name TEXT NOT NULL DEFAULT '',
+    unit_id INTEGER REFERENCES units(id),
+    unit_name TEXT NOT NULL,
+    quantity REAL NOT NULL CHECK (quantity > 0),
+    specifications TEXT NOT NULL DEFAULT '',
+    is_unregistered INTEGER NOT NULL DEFAULT 0,
+    description TEXT NOT NULL DEFAULT '',
+    reference_file_id INTEGER REFERENCES files(id),
+    catalog_review TEXT CHECK (catalog_review IN ('pendiente','incorporado','descartado')),
+    approved_quantity REAL,
+    purchasing_comment TEXT NOT NULL DEFAULT '',
+    supplier_id INTEGER REFERENCES suppliers(id),
+    estimated_unit_price REAL
+  );
+  CREATE INDEX idx_items_req ON requisition_items(requisition_id);
+
+  CREATE TABLE quotations (
+    id INTEGER PRIMARY KEY,
+    requisition_id INTEGER NOT NULL REFERENCES requisitions(id),
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    file_id INTEGER REFERENCES files(id),
+    amount REAL,
+    currency TEXT,
+    notes TEXT NOT NULL DEFAULT '',
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE purchases (
+    id INTEGER PRIMARY KEY,
+    requisition_id INTEGER NOT NULL REFERENCES requisitions(id),
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    purchase_date TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE purchase_items (
+    id INTEGER PRIMARY KEY,
+    purchase_id INTEGER NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
+    requisition_item_id INTEGER NOT NULL REFERENCES requisition_items(id),
+    quantity REAL NOT NULL CHECK (quantity > 0),
+    unit_price REAL NOT NULL CHECK (unit_price >= 0)
+  );
+
+  CREATE TABLE invoices (
+    id INTEGER PRIMARY KEY,
+    requisition_id INTEGER NOT NULL REFERENCES requisitions(id),
+    purchase_id INTEGER REFERENCES purchases(id),
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    number TEXT NOT NULL,
+    invoice_date TEXT NOT NULL,
+    due_date TEXT NOT NULL,
+    amount REAL NOT NULL CHECK (amount > 0),
+    currency TEXT NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    notes TEXT NOT NULL DEFAULT '',
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    UNIQUE (supplier_id, number)
+  );
+
+  CREATE TABLE payments (
+    id INTEGER PRIMARY KEY,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+    status TEXT NOT NULL CHECK (status IN ('programado','realizado','anulado')),
+    amount REAL NOT NULL CHECK (amount > 0),
+    scheduled_date TEXT,
+    paid_date TEXT,
+    method TEXT,
+    reference TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    file_id INTEGER REFERENCES files(id),
+    extraordinary INTEGER NOT NULL DEFAULT 0,
+    extraordinary_reason TEXT NOT NULL DEFAULT '',
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_by INTEGER REFERENCES users(id),
+    updated_at TEXT
+  );
+  CREATE INDEX idx_payments_invoice ON payments(invoice_id);
+
+  CREATE TABLE requisition_events (
+    id INTEGER PRIMARY KEY,
+    requisition_id INTEGER NOT NULL REFERENCES requisitions(id),
+    user_id INTEGER REFERENCES users(id),
+    action TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    comment TEXT NOT NULL DEFAULT '',
+    finance_only INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_events_req ON requisition_events(requisition_id);
+  `,
+];
