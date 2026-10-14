@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { getDb, today } from '../../lib/db.js';
+import { db, today } from '../../lib/db.js';
 import { requireAuth, requirePerm } from '../../lib/auth.js';
 import { parse } from '../../lib/errors.js';
 import { EPS, round2 } from '../../lib/money.js';
@@ -10,14 +10,13 @@ import { invoiceBalances } from './service.js';
 const router = Router();
 router.use(requireAuth, requirePerm('reportes.ver'));
 
-router.get('/gastos', (req, res) => {
+router.get('/gastos', async (req, res) => {
   const q = parse(z.object({ desde: optDate.optional(), hasta: optDate.optional() }), req.query);
-  const db = getDb();
-  const desde = q.desde || '0000-01-01';
+    const desde = q.desde || '0000-01-01';
   const hasta = q.hasta || '9999-12-31';
 
-  const invoices = invoiceBalances(`r.status != 'anulada' AND i.invoice_date BETWEEN @desde AND @hasta`, { desde, hasta });
-  const depts = new Map(db.prepare('SELECT id, name FROM departments').all().map((d) => [d.id, d.name]));
+  const invoices = await invoiceBalances(`r.status != 'anulada' AND i.invoice_date BETWEEN @desde AND @hasta`, { desde, hasta });
+  const depts = new Map((await db.all('SELECT id, name FROM departments')).map((d) => [d.id, d.name]));
 
   const group = (keyFn, labelFn) => {
     const map = new Map();
@@ -33,21 +32,21 @@ router.get('/gastos', (req, res) => {
     return [...map.values()].sort((a, b) => b.facturado - a.facturado);
   };
 
-  const approved = db.prepare(`
+  const approved = await db.all(`
     SELECT r.department_id, d.name AS label, r.currency, COUNT(*) AS requisiciones, ROUND(SUM(r.approved_total), 2) AS aprobado
     FROM requisitions r JOIN departments d ON d.id = r.department_id
     WHERE r.approved_total IS NOT NULL AND substr(r.decided_at, 1, 10) BETWEEN ? AND ?
-    GROUP BY r.department_id, r.currency ORDER BY aprobado DESC`).all(desde, hasta);
+    GROUP BY r.department_id, d.name, r.currency ORDER BY aprobado DESC`, [desde, hasta]);
 
-  const paidByMonth = db.prepare(`
+  const paidByMonth = await db.all(`
     SELECT substr(p.paid_date, 1, 7) AS mes, i.currency, ROUND(SUM(p.amount), 2) AS pagado, COUNT(*) AS pagos
     FROM payments p JOIN invoices i ON i.id = p.invoice_id
     WHERE p.status = 'realizado' AND p.paid_date BETWEEN ? AND ?
-    GROUP BY mes, i.currency ORDER BY mes`).all(desde, hasta);
+    GROUP BY mes, i.currency ORDER BY mes`, [desde, hasta]);
 
   const t = today();
   const addDays = (n) => { const d = new Date(`${t}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
-  const open = invoiceBalances(`r.status != 'anulada'`).filter((i) => i.balance > EPS);
+  const open = (await invoiceBalances(`r.status != 'anulada'`)).filter((i) => i.balance > EPS);
   const aging = { vencido: {}, '0-7': {}, '8-30': {}, '31+': {} };
   for (const i of open) {
     const bucket = i.due_date < t ? 'vencido' : i.due_date <= addDays(7) ? '0-7' : i.due_date <= addDays(30) ? '8-30' : '31+';

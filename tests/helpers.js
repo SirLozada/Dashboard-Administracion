@@ -9,19 +9,15 @@ export async function startServer() {
   process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'herbaplant-test-'));
   process.env.ADMIN_PASSWORD = 'Admin12345';
   process.env.DEMO_PASSWORD = 'Herbaplant2026';
-  const { getDb } = await import('../server/lib/db.js');
-  const { bootstrap } = await import('../server/bootstrap.js');
+  const { bootstrap, seedDemo } = await import('../server/bootstrap.js');
   const { createApp } = await import('../server/app.js');
-  getDb();
-  bootstrap({ log: () => {} });
-  const origLog = console.log;
-  console.log = () => {};
-  await import('../server/scripts/seed-demo.js');
-  console.log = origLog;
+  const { closeDb } = await import('../server/lib/db.js');
+  await bootstrap({ log: () => {} });
+  await seedDemo({ log: () => {} });
   const server = createApp().listen(0);
   await new Promise((r) => server.once('listening', r));
   const base = `http://127.0.0.1:${server.address().port}`;
-  return { base, db: getDb(), close: () => new Promise((r) => server.close(r)) };
+  return { base, close: async () => { server.closeAllConnections?.(); await new Promise((r) => server.close(r)); await closeDb(); } };
 }
 
 export function client(base) {

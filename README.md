@@ -12,7 +12,9 @@ npm run build          # compila la interfaz (client/dist)
 npm start              # http://localhost:3000
 ```
 
-En el primer arranque se crea la base de datos (`data/herbaplant.db`), el catálogo base, los departamentos y el **superadministrador** `admin`. Su contraseña temporal se muestra en la consola (o defínala con `ADMIN_PASSWORD`); se pide cambiarla al ingresar.
+Localmente no hace falta instalar una base de datos: se usa Postgres embebido (PGlite) guardado en `data/`. Si define `DATABASE_URL`, se usa ese servidor PostgreSQL.
+
+En el primer arranque se crean las tablas, el catálogo base, los departamentos y el **superadministrador** `admin`. Su contraseña temporal se muestra en la consola (o defínala con `ADMIN_PASSWORD`); se pide cambiarla al ingresar.
 
 Datos de demostración (usuarios por rol y proveedores, contraseña `Herbaplant2026`):
 
@@ -29,12 +31,29 @@ npm run seed:demo
 
 Desarrollo con recarga: `npm run dev` (API en :3000, interfaz Vite en :5173). Pruebas: `npm test`.
 
+## Publicar en Vercel
+
+1. En [vercel.com](https://vercel.com) → **Add New… → Project** → importe el repositorio `Dashboard-Administracion` (rama `claude/herbaplant-requisiciones-qpy13k` o la que contenga este código). La configuración se toma de `vercel.json`; no cambie los comandos.
+2. En el proyecto → **Storage**:
+   - **Create Database → Neon (Postgres)** y conéctela al proyecto (crea `DATABASE_URL`).
+   - **Create → Blob**, con acceso **Private**, y conéctelo al proyecto (crea `BLOB_READ_WRITE_TOKEN`). Guarda facturas, cotizaciones y comprobantes.
+3. En **Settings → Environment Variables** agregue:
+   - `ADMIN_PASSWORD` — contraseña inicial del superadministrador `admin` (se pedirá cambiarla).
+   - `SEED_DEMO` = `true` — solo para el piloto: crea los usuarios y proveedores de demostración. Quítela antes de usarlo en producción.
+4. **Deployments → Redeploy**. La primera visita crea las tablas y datos iniciales automáticamente.
+
+Diferencias en Vercel: las notificaciones se actualizan cada 15 segundos (no hay conexiones permanentes) y los adjuntos tienen un máximo de 4 MB por archivo (límite de la plataforma).
+
 ### Variables de entorno
 
 | Variable | Uso |
 |---|---|
 | `PORT` | Puerto HTTP (3000) |
-| `DATA_DIR` | Carpeta de la base de datos y los adjuntos (`./data`) — respaldar periódicamente |
+| `DATABASE_URL` | Servidor PostgreSQL (Neon en Vercel). Sin ella se usa Postgres embebido en `DATA_DIR` |
+| `BLOB_READ_WRITE_TOKEN` | Almacén Vercel Blob para adjuntos. Sin él se guardan en `DATA_DIR/uploads` |
+| `BLOB_ACCESS` | `private` (por defecto) o `public`, según cómo se creó el almacén Blob |
+| `SEED_DEMO` | `true` crea los usuarios de demostración al iniciar |
+| `DATA_DIR` | Carpeta local de la base de datos y los adjuntos (`./data`) — respaldar periódicamente |
 | `ADMIN_USER`, `ADMIN_PASSWORD`, `ADMIN_EMAIL` | Superadministrador inicial |
 | `COOKIE_SECURE=true` | Cookie de sesión solo por HTTPS (recomendado en producción) |
 | `TRUST_PROXY=true` | Si corre detrás de un proxy inverso (nginx, etc.) |
@@ -61,7 +80,7 @@ Controles implementados en el servidor:
 - Prevención de duplicados: token por formulario, facturas únicas por proveedor, referencias de pago repetidas y control de concurrencia en los cambios de estado.
 - Archivos (PDF/JPG/PNG validados por firma) servidos solo tras verificar permisos.
 - Contraseñas con scrypt, sesiones con cookie HttpOnly/SameSite, límite de intentos de acceso, protección CSRF y bitácora de auditoría.
-- Notificaciones internas en tiempo real (SSE) con campana y contador.
+- Notificaciones internas en tiempo real (SSE; consulta cada 15 s en Vercel) con campana y contador.
 
 ## Arquitectura
 
@@ -69,12 +88,13 @@ Controles implementados en el servidor:
 shared/constants.js          estados, roles y permisos (servidor y cliente)
 server/
   app.js, index.js           Express, seguridad, manejo de errores
-  lib/                       BD (SQLite + migraciones), auth, archivos, notificaciones, auditoría
+  lib/                       BD (PostgreSQL + migraciones), auth, archivos, notificaciones, auditoría
   modules/core/              autenticación, notificaciones, archivos, administración del sistema
   modules/requisiciones/     requisiciones, pagos, reportes (registrado en modules/index.js)
 client/src/
   modules.js                 navegación por módulo y permiso
   pages/, components/        interfaz React
+api/index.js                 entrada de la API como función de Vercel
 tests/                       pruebas de integración del flujo completo
 ```
 

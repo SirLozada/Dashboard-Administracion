@@ -1,14 +1,15 @@
 import { tx } from './db.js';
-import { discardNotifications, flushNotifications } from './notify.js';
+import { discardNotifications, flushNotifications, startNotifications } from './notify.js';
 
 /** Ejecuta un caso de uso en una transacción y emite las notificaciones solo si se confirma. */
-export function txn(fn) {
+export async function txn(fn) {
+  const batch = startNotifications();
   try {
-    const out = tx(fn);
-    flushNotifications();
+    const out = await tx(() => batch.run(fn));
+    flushNotifications(batch);
     return out;
   } catch (err) {
-    discardNotifications();
+    discardNotifications(batch);
     throw err;
   }
 }

@@ -1,7 +1,6 @@
-import fs from 'node:fs';
 import { Router } from 'express';
 import { z } from 'zod';
-import { getDb, now } from '../../lib/db.js';
+import { db, now } from '../../lib/db.js';
 import {
   COOKIE, can, cookieOptions, createSession, destroySession, destroyUserSessions, hashPassword, loadUser,
   loginBlocked, loginFailed, loginSucceeded, permissionsFor, publicUser, requireAuth, requirePerm, sha256,
@@ -9,9 +8,9 @@ import {
 } from '../../lib/auth.js';
 import { audit } from '../../lib/audit.js';
 import { badRequest, conflict, forbidden, HttpError, notFound, parse } from '../../lib/errors.js';
-import { FINANCE_KINDS, discardUpload, filePath, storeUpload, uploadSingle } from '../../lib/files.js';
-import { addStream } from '../../lib/notify.js';
-import { DEFAULT_SETTINGS, getCurrencies, getSettings } from '../../lib/settings.js';
+import { FINANCE_KINDS, discardUpload, openStored, storeUpload, uploadSingle } from '../../lib/files.js';
+import { REALTIME, addStream } from '../../lib/notify.js';
+import { DEFAULT_SETTINGS, getCurrencies, getSettings, maxUploadMb } from '../../lib/settings.js';
 import { txn } from '../../lib/txn.js';
 import { bool, id, optId, reqText, text } from '../../lib/validate.js';
 import { PERMISOS, PERMISOS_BLOQUEADOS_SUPERADMIN, ROLES } from '../../../shared/constants.js';
@@ -23,55 +22,54 @@ const router = Router();
 // Autenticación
 // ===========================================================================
 
-router.post('/auth/login', (req, res) => {
+router.post('/auth/login', async (req, res) => {
   const { usuario, password } = parse(z.object({
     usuario: reqText('El usuario o correo', 1, 120),
     password: z.string().min(1, 'La contraseña es obligatoria.').max(200),
   }), req.body);
   const key = `${req.ip}|${usuario.toLowerCase()}`;
-  if (loginBlocked(key)) throw new HttpError(429, 'Demasiados intentos fallidos. Espere 15 minutos e intente de nuevo.');
+  if (await loginBlocked(key)) throw new HttpError(429, 'Demasiados intentos fallidos. Espere 15 minutos e intente de nuevo.');
 
-  const db = getDb();
-  const row = db.prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(usuario, usuario);
+    const row = await db.get('SELECT * FROM users WHERE username = ? OR email = ?', [usuario, usuario]);
   if (!row || !verifyPassword(password, row.password_hash)) {
-    loginFailed(key);
-    if (row) audit(req, 'login_fallido', 'usuario', row.id, null, row.id);
+    await loginFailed(key);
+    if (row) await audit(req, 'login_fallido', 'usuario', row.id, null, row.id);
     throw new HttpError(401, 'Usuario o contraseña incorrectos.');
   }
   if (!row.active) throw new HttpError(403, 'Su usuario está inactivo. Contacte al administrador del sistema.');
-  loginSucceeded(key);
-  const { token, expires } = createSession(row.id, req);
-  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now(), row.id);
-  audit(req, 'login', 'usuario', row.id, null, row.id);
-  const user = loadUser(row.id);
-  user.permissions = permissionsFor(user);
+  await loginSucceeded(key);
+  const { token, expires } = await createSession(row.id, req);
+  await db.run('UPDATE users SET last_login_at = ? WHERE id = ?', [now(), row.id]);
+  await audit(req, 'login', 'usuario', row.id, null, row.id);
+  const user = await loadUser(row.id);
+  user.permissions = await permissionsFor(user);
   res.cookie(COOKIE, token, cookieOptions(expires)).json({ user: publicUser(user) });
 });
 
-router.post('/auth/logout', (req, res) => {
-  destroySession(req.sessionToken);
+router.post('/auth/logout', async (req, res) => {
+  await destroySession(req.sessionToken);
   res.clearCookie(COOKIE, cookieOptions()).json({ ok: true });
 });
 
-router.get('/auth/me', requireAuth, (req, res) => {
-  const s = getSettings();
+router.get('/auth/me', requireAuth, async (req, res) => {
+  const s = await getSettings();
   res.json({
     user: publicUser(req.user),
-    config: { empresa: s.empresa_nombre, monedas: getCurrencies(), moneda_principal: s.moneda_principal, max_archivo_mb: Number(s.max_archivo_mb) },
+    config: { empresa: s.empresa_nombre, monedas: await getCurrencies(), moneda_principal: s.moneda_principal, max_archivo_mb: await maxUploadMb(), tiempo_real: REALTIME },
   });
 });
 
-router.post('/auth/cambiar-clave', requireAuth, (req, res) => {
+router.post('/auth/cambiar-clave', requireAuth, async (req, res) => {
   const body = parse(z.object({ actual: z.string().min(1, 'Indique su contraseña actual.'), nueva: z.string().max(200) }), req.body);
-  const row = getDb().prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+  const row = await db.get('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
   if (!verifyPassword(body.actual, row.password_hash)) throw badRequest('La contraseña actual no es correcta.');
   const weak = validatePasswordStrength(body.nueva);
   if (weak) throw badRequest(weak);
   if (body.actual === body.nueva) throw badRequest('La nueva contraseña debe ser diferente a la actual.');
-  getDb().prepare('UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?').run(hashPassword(body.nueva), now(), req.user.id);
+  await db.run('UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?', [hashPassword(body.nueva), now(), req.user.id]);
   // Cierra las demás sesiones abiertas del usuario.
-  getDb().prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(req.user.id, sha256(req.sessionToken));
-  audit(req, 'cambiar_clave', 'usuario', req.user.id);
+  await db.run('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?', [req.user.id, sha256(req.sessionToken)]);
+  await audit(req, 'cambiar_clave', 'usuario', req.user.id);
   res.json({ ok: true });
 });
 
@@ -79,26 +77,27 @@ router.post('/auth/cambiar-clave', requireAuth, (req, res) => {
 // Notificaciones
 // ===========================================================================
 
-router.get('/notificaciones', requireAuth, (req, res) => {
+router.get('/notificaciones', requireAuth, async (req, res) => {
   const q = parse(z.object({ no_leidas: bool.optional(), limite: z.coerce.number().int().min(1).max(200).default(30) }), req.query);
-  const db = getDb();
-  const items = db.prepare(`SELECT * FROM notifications WHERE user_id = ? ${q.no_leidas ? 'AND read_at IS NULL' : ''} ORDER BY id DESC LIMIT ?`).all(req.user.id, q.limite);
-  const unread = db.prepare('SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL').pluck().get(req.user.id);
+    const items = await db.all(`SELECT * FROM notifications WHERE user_id = ? ${q.no_leidas ? 'AND read_at IS NULL' : ''} ORDER BY id DESC LIMIT ?`, [req.user.id, q.limite]);
+  const unread = await db.value('SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL', [req.user.id]);
   res.json({ items, no_leidas: unread });
 });
 
-router.post('/notificaciones/:id/leer', requireAuth, (req, res) => {
-  getDb().prepare('UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL').run(now(), parse(id, req.params.id), req.user.id);
+router.post('/notificaciones/:id/leer', requireAuth, async (req, res) => {
+  await db.run('UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ? AND read_at IS NULL', [now(), parse(id, req.params.id), req.user.id]);
   res.json({ ok: true });
 });
 
-router.post('/notificaciones/leer-todas', requireAuth, (req, res) => {
-  getDb().prepare('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL').run(now(), req.user.id);
+router.post('/notificaciones/leer-todas', requireAuth, async (req, res) => {
+  await db.run('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL', [now(), req.user.id]);
   res.json({ ok: true });
 });
 
 // Canal de eventos en tiempo real (Server-Sent Events).
-router.get('/eventos', requireAuth, (req, res) => {
+router.get('/eventos', requireAuth, async (req, res) => {
+  // Sin servidor persistente (Vercel) el cliente usa consultas periódicas.
+  if (!REALTIME) return res.status(204).end();
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.flushHeaders();
   res.write('retry: 5000\n\n');
@@ -111,53 +110,52 @@ router.get('/eventos', requireAuth, (req, res) => {
 // Archivos protegidos
 // ===========================================================================
 
-router.post('/archivos', requireAuth, requirePerm('req.crear'), uploadSingle(), (req, res) => {
+router.post('/archivos', requireAuth, requirePerm('req.crear'), uploadSingle(), async (req, res) => {
   try {
-    const f = txn(() => storeUpload(req.file, { kind: 'referencia', userId: req.user.id }));
+    const f = await txn(async () => await storeUpload(req.file, { kind: 'referencia', userId: req.user.id }));
     res.status(201).json({ ...f, url: `/api/archivos/${f.uuid}` });
   } catch (e) { discardUpload(req.file); throw e; }
 });
 
-router.get('/archivos/:uuid', requireAuth, (req, res) => {
+router.get('/archivos/:uuid', requireAuth, async (req, res) => {
   const uuid = parse(z.string().uuid(), req.params.uuid);
-  const db = getDb();
-  const f = db.prepare('SELECT * FROM files WHERE uuid = ?').get(uuid);
+    const f = await db.get('SELECT * FROM files WHERE uuid = ?', [uuid]);
   if (!f) throw notFound('Archivo no encontrado.');
   const user = req.user;
   if (f.requisition_id) {
-    const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(f.requisition_id);
+    const r = await db.get('SELECT * FROM requisitions WHERE id = ?', [f.requisition_id]);
     if (!r || !canView(user, r)) throw notFound('Archivo no encontrado.');
   } else if (f.uploaded_by !== user.id) {
     throw notFound('Archivo no encontrado.');
   }
   if (FINANCE_KINDS.has(f.kind) && !can(user, 'req.ver_finanzas')) throw forbidden('No tiene acceso a documentos financieros.');
-  const p = filePath(f.stored_name);
-  if (!fs.existsSync(p)) throw notFound('El archivo no está disponible en el servidor.');
+  const stream = await openStored(f.stored_name);
+  if (!stream) throw notFound('El archivo no está disponible en el servidor.');
   res.set({
     'Content-Type': f.mime,
     'Content-Disposition': `${req.query.descargar ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(f.original_name)}`,
     'Cache-Control': 'private, no-store',
     'Content-Security-Policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; plugin-types application/pdf",
   });
-  res.sendFile(p);
+  stream.on('error', () => res.destroy());
+  stream.pipe(res);
 });
 
 // ===========================================================================
 // Datos maestros de solo lectura (formulario, filtros)
 // ===========================================================================
 
-router.get('/catalogo', requireAuth, (_req, res) => {
-  const db = getDb();
-  res.json({
-    categorias: db.prepare('SELECT id, name, description FROM categories WHERE active = 1 ORDER BY name').all(),
-    unidades: db.prepare('SELECT id, name, abbreviation FROM units WHERE active = 1 ORDER BY name').all(),
-    articulos: db.prepare(`SELECT a.id, a.code, a.name, a.category_id, a.unit_id, a.description, c.name AS category_name
-      FROM articles a JOIN categories c ON c.id = a.category_id WHERE a.active = 1 AND c.active = 1 ORDER BY a.name`).all(),
+router.get('/catalogo', requireAuth, async (_req, res) => {
+    res.json({
+    categorias: await db.all('SELECT id, name, description FROM categories WHERE active = 1 ORDER BY name'),
+    unidades: await db.all('SELECT id, name, abbreviation FROM units WHERE active = 1 ORDER BY name'),
+    articulos: await db.all(`SELECT a.id, a.code, a.name, a.category_id, a.unit_id, a.description, c.name AS category_name
+      FROM articles a JOIN categories c ON c.id = a.category_id WHERE a.active = 1 AND c.active = 1 ORDER BY a.name`),
   });
 });
 
-router.get('/departamentos', requireAuth, (_req, res) => {
-  res.json(getDb().prepare('SELECT id, name, code, active FROM departments ORDER BY name').all());
+router.get('/departamentos', requireAuth, async (_req, res) => {
+  res.json(await db.all('SELECT id, name, code, active FROM departments ORDER BY name'));
 });
 
 // ===========================================================================
@@ -174,35 +172,33 @@ const supplierSchema = z.object({
   active: bool.default(true),
 });
 
-router.get('/proveedores', requireAuth, requirePerm('proveedores.gestionar', 'req.revisar', 'pagos.gestionar'), (req, res) => {
+router.get('/proveedores', requireAuth, requirePerm('proveedores.gestionar', 'req.revisar', 'pagos.gestionar'), async (req, res) => {
   const all = req.query.todos === '1';
-  res.json(getDb().prepare(`SELECT * FROM suppliers ${all ? '' : 'WHERE active = 1'} ORDER BY name`).all());
+  res.json(await db.all(`SELECT * FROM suppliers ${all ? '' : 'WHERE active = 1'} ORDER BY name`));
 });
 
-router.post('/proveedores', requireAuth, requirePerm('proveedores.gestionar'), (req, res) => {
+router.post('/proveedores', requireAuth, requirePerm('proveedores.gestionar'), async (req, res) => {
   const body = parse(supplierSchema, req.body);
-  const row = txn(() => {
-    const db = getDb();
-    if (db.prepare('SELECT 1 FROM suppliers WHERE name = ?').get(body.name)) throw conflict('Ya existe un proveedor con ese nombre.');
-    const info = db.prepare(`INSERT INTO suppliers (name, tax_id, contact_name, phone, email, address, active, created_at, updated_at)
-      VALUES (@name, @tax_id, @contact_name, @phone, @email, @address, @active, @ts, @ts)`).run({ ...body, active: body.active ? 1 : 0, ts: now() });
-    audit(req, 'crear', 'proveedor', Number(info.lastInsertRowid), { name: body.name });
-    return db.prepare('SELECT * FROM suppliers WHERE id = ?').get(info.lastInsertRowid);
+  const row = await txn(async () => {
+        if (await db.get('SELECT 1 FROM suppliers WHERE name = ?', [body.name])) throw conflict('Ya existe un proveedor con ese nombre.');
+    const info = await db.run(`INSERT INTO suppliers (name, tax_id, contact_name, phone, email, address, active, created_at, updated_at)
+      VALUES (@name, @tax_id, @contact_name, @phone, @email, @address, @active, @ts, @ts) RETURNING id`, { ...body, active: body.active ? 1 : 0, ts: now() });
+    await audit(req, 'crear', 'proveedor', info.id, { name: body.name });
+    return await db.get('SELECT * FROM suppliers WHERE id = ?', [info.id]);
   });
   res.status(201).json(row);
 });
 
-router.put('/proveedores/:id', requireAuth, requirePerm('proveedores.gestionar'), (req, res) => {
+router.put('/proveedores/:id', requireAuth, requirePerm('proveedores.gestionar'), async (req, res) => {
   const sid = parse(id, req.params.id);
   const body = parse(supplierSchema, req.body);
-  const row = txn(() => {
-    const db = getDb();
-    if (!db.prepare('SELECT 1 FROM suppliers WHERE id = ?').get(sid)) throw notFound();
-    if (db.prepare('SELECT 1 FROM suppliers WHERE name = ? AND id != ?').get(body.name, sid)) throw conflict('Ya existe un proveedor con ese nombre.');
-    db.prepare(`UPDATE suppliers SET name=@name, tax_id=@tax_id, contact_name=@contact_name, phone=@phone, email=@email,
-      address=@address, active=@active, updated_at=@ts WHERE id=@id`).run({ ...body, active: body.active ? 1 : 0, ts: now(), id: sid });
-    audit(req, 'editar', 'proveedor', sid, body);
-    return db.prepare('SELECT * FROM suppliers WHERE id = ?').get(sid);
+  const row = await txn(async () => {
+        if (!await db.get('SELECT 1 FROM suppliers WHERE id = ?', [sid])) throw notFound();
+    if (await db.get('SELECT 1 FROM suppliers WHERE name = ? AND id != ?', [body.name, sid])) throw conflict('Ya existe un proveedor con ese nombre.');
+    await db.run(`UPDATE suppliers SET name=@name, tax_id=@tax_id, contact_name=@contact_name, phone=@phone, email=@email,
+      address=@address, active=@active, updated_at=@ts WHERE id=@id`, { ...body, active: body.active ? 1 : 0, ts: now(), id: sid });
+    await audit(req, 'editar', 'proveedor', sid, body);
+    return await db.get('SELECT * FROM suppliers WHERE id = ?', [sid]);
   });
   res.json(row);
 });
@@ -230,60 +226,58 @@ const userSchema = z.object({
   if (v.role !== 'superadmin' && !v.department_id) ctx.addIssue({ code: 'custom', message: 'Seleccione el departamento.', path: ['department_id'] });
 });
 
-function userRow(uid) {
-  const db = getDb();
-  const u = db.prepare(`SELECT u.id, u.username, u.email, u.first_name, u.last_name, u.position, u.department_id, d.name AS department_name,
-    u.role, u.active, u.must_change_password, u.last_login_at, u.created_at FROM users u LEFT JOIN departments d ON d.id = u.department_id WHERE u.id = ?`).get(uid);
-  if (u) u.permisos_extra = db.prepare('SELECT permission FROM user_permissions WHERE user_id = ?').pluck().all(uid);
+async function userRow(uid) {
+    const u = await db.get(`SELECT u.id, u.username, u.email, u.first_name, u.last_name, u.position, u.department_id, d.name AS department_name,
+    u.role, u.active, u.must_change_password, u.last_login_at, u.created_at FROM users u LEFT JOIN departments d ON d.id = u.department_id WHERE u.id = ?`, [uid]);
+  if (u) u.permisos_extra = await db.column('SELECT permission FROM user_permissions WHERE user_id = ?', [uid]);
   return u;
 }
 
-admin.get('/usuarios', requirePerm('admin.usuarios'), (_req, res) => {
-  const ids = getDb().prepare('SELECT id FROM users ORDER BY active DESC, first_name, last_name').pluck().all();
-  res.json(ids.map(userRow));
+admin.get('/usuarios', requirePerm('admin.usuarios'), async (_req, res) => {
+  const ids = await db.column('SELECT id FROM users ORDER BY active DESC, first_name, last_name');
+  res.json(await Promise.all(ids.map(userRow)));
 });
 
-function saveUser(req, uid) {
+async function saveUser(req, uid) {
   const body = parse(userSchema, req.body);
-  const db = getDb();
-  if (body.department_id && !db.prepare('SELECT 1 FROM departments WHERE id = ?').get(body.department_id)) throw badRequest('Departamento inválido.');
-  if (db.prepare('SELECT 1 FROM users WHERE username = ? AND id != ?').get(body.username, uid ?? -1)) throw conflict('El nombre de usuario ya está en uso.');
-  if (db.prepare('SELECT 1 FROM users WHERE email = ? AND id != ?').get(body.email, uid ?? -1)) throw conflict('El correo electrónico ya está registrado.');
+    if (body.department_id && !await db.get('SELECT 1 FROM departments WHERE id = ?', [body.department_id])) throw badRequest('Departamento inválido.');
+  if (await db.get('SELECT 1 FROM users WHERE username = ? AND id != ?', [body.username, uid ?? -1])) throw conflict('El nombre de usuario ya está en uso.');
+  if (await db.get('SELECT 1 FROM users WHERE email = ? AND id != ?', [body.email, uid ?? -1])) throw conflict('El correo electrónico ya está registrado.');
   if (body.password || !uid) {
     const weak = validatePasswordStrength(body.password || '');
     if (weak) throw badRequest(weak);
   }
-  return txn(() => {
+  return await txn(async () => {
     const ts = now();
     const params = { ...body, active: body.active ? 1 : 0, department_id: body.department_id ?? null, ts };
     if (uid) {
-      const prev = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+      const prev = await db.get('SELECT * FROM users WHERE id = ?', [uid]);
       if (!prev) throw notFound('Usuario no encontrado.');
       if (uid === req.user.id && (!body.active || body.role !== prev.role)) throw badRequest('No puede desactivar ni cambiar el rol de su propio usuario.');
-      db.prepare(`UPDATE users SET username=@username, email=@email, first_name=@first_name, last_name=@last_name, position=@position,
-        department_id=@department_id, role=@role, active=@active, updated_at=@ts WHERE id=@id`).run({ ...params, id: uid });
-      if (body.password) db.prepare('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?').run(hashPassword(body.password), uid);
-      if (!body.active || body.password || prev.role !== body.role) destroyUserSessions(uid);
-      audit(req, 'editar', 'usuario', uid, {
+      await db.run(`UPDATE users SET username=@username, email=@email, first_name=@first_name, last_name=@last_name, position=@position,
+        department_id=@department_id, role=@role, active=@active, updated_at=@ts WHERE id=@id`, { ...params, id: uid });
+      if (body.password) await db.run('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?', [hashPassword(body.password), uid]);
+      if (!body.active || body.password || prev.role !== body.role) await destroyUserSessions(uid);
+      await audit(req, 'editar', 'usuario', uid, {
         username: body.username, role: body.role, active: body.active, ...(body.password ? { clave: 'restablecida' } : {}),
         ...(prev.active && !body.active ? { estado: 'desactivado' } : {}),
       });
     } else {
-      const info = db.prepare(`INSERT INTO users (username, email, first_name, last_name, position, department_id, role, active,
+      const info = await db.run(`INSERT INTO users (username, email, first_name, last_name, position, department_id, role, active,
         password_hash, must_change_password, created_at, updated_at) VALUES (@username, @email, @first_name, @last_name, @position,
-        @department_id, @role, @active, @hash, 1, @ts, @ts)`).run({ ...params, hash: hashPassword(body.password) });
-      uid = Number(info.lastInsertRowid);
-      audit(req, 'crear', 'usuario', uid, { username: body.username, role: body.role });
+        @department_id, @role, @active, @hash, 1, @ts, @ts) RETURNING id`, { ...params, hash: hashPassword(body.password) });
+      uid = info.id;
+      await audit(req, 'crear', 'usuario', uid, { username: body.username, role: body.role });
     }
-    db.prepare('DELETE FROM user_permissions WHERE user_id = ?').run(uid);
-    const ins = db.prepare('INSERT INTO user_permissions (user_id, permission) VALUES (?, ?)');
-    for (const p of new Set(body.permisos_extra)) ins.run(uid, p);
-    return userRow(uid);
+    await db.run('DELETE FROM user_permissions WHERE user_id = ?', [uid]);
+    const ins = ((...a) => db.run('INSERT INTO user_permissions (user_id, permission) VALUES (?, ?)', a.length === 1 && typeof a[0] === "object" && !Array.isArray(a[0]) ? a[0] : a));
+    for (const p of new Set(body.permisos_extra)) await ins(uid, p);
+    return await userRow(uid);
   });
 }
 
-admin.post('/usuarios', requirePerm('admin.usuarios'), (req, res) => res.status(201).json(saveUser(req)));
-admin.put('/usuarios/:id', requirePerm('admin.usuarios'), (req, res) => res.json(saveUser(req, parse(id, req.params.id))));
+admin.post('/usuarios', requirePerm('admin.usuarios'), async (req, res) => res.status(201).json(await saveUser(req)));
+admin.put('/usuarios/:id', requirePerm('admin.usuarios'), async (req, res) => res.json(await saveUser(req, parse(id, req.params.id))));
 
 // ---------- Departamentos ----------
 const deptSchema = z.object({
@@ -292,37 +286,33 @@ const deptSchema = z.object({
   active: bool.default(true),
 });
 
-admin.get('/departamentos', requirePerm('admin.departamentos', 'admin.usuarios'), (_req, res) => {
-  res.json(getDb().prepare(`SELECT d.*, (SELECT COUNT(*) FROM users u WHERE u.department_id = d.id AND u.active = 1) AS usuarios,
-    (SELECT COUNT(*) FROM requisitions r WHERE r.department_id = d.id) AS requisiciones FROM departments d ORDER BY d.name`).all());
+admin.get('/departamentos', requirePerm('admin.departamentos', 'admin.usuarios'), async (_req, res) => {
+  res.json(await db.all(`SELECT d.*, (SELECT COUNT(*) FROM users u WHERE u.department_id = d.id AND u.active = 1) AS usuarios,
+    (SELECT COUNT(*) FROM requisitions r WHERE r.department_id = d.id) AS requisiciones FROM departments d ORDER BY d.name`));
 });
 
 function crud(table, entity, schema, perm, { unique = ['name'], map = (b) => b } = {}) {
   const cols = Object.keys(schema.shape);
-  admin.post(`/${entity}`, requirePerm(perm), (req, res) => {
+  admin.post(`/${entity}`, requirePerm(perm), async (req, res) => {
     const body = map(parse(schema, req.body));
-    const row = txn(() => {
-      const db = getDb();
-      for (const u of unique) if (body[u] && db.prepare(`SELECT 1 FROM ${table} WHERE ${u} = ?`).get(body[u])) throw conflict(`Ya existe un registro con ese ${u === 'code' ? 'código' : 'nombre'}.`);
+    const row = await txn(async () => {
+            for (const u of unique) if (body[u] && await db.get(`SELECT 1 FROM ${table} WHERE ${u} = ?`, [body[u]])) throw conflict(`Ya existe un registro con ese ${u === 'code' ? 'código' : 'nombre'}.`);
       const ts = now();
-      const info = db.prepare(`INSERT INTO ${table} (${cols.join(',')}, created_at, updated_at) VALUES (${cols.map((c) => `@${c}`).join(',')}, @ts, @ts)`)
-        .run({ ...body, active: body.active ? 1 : 0, ts });
-      audit(req, 'crear', entity, Number(info.lastInsertRowid), body);
-      return db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(info.lastInsertRowid);
+      const info = await db.run(`INSERT INTO ${table} (${cols.join(',')}, created_at, updated_at) VALUES (${cols.map((c) => `@${c}`).join(',')}, @ts, @ts) RETURNING id`, { ...body, active: body.active ? 1 : 0, ts });
+      await audit(req, 'crear', entity, info.id, body);
+      return await db.get(`SELECT * FROM ${table} WHERE id = ?`, [info.id]);
     });
     res.status(201).json(row);
   });
-  admin.put(`/${entity}/:id`, requirePerm(perm), (req, res) => {
+  admin.put(`/${entity}/:id`, requirePerm(perm), async (req, res) => {
     const rid = parse(id, req.params.id);
     const body = map(parse(schema, req.body));
-    const row = txn(() => {
-      const db = getDb();
-      if (!db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(rid)) throw notFound();
-      for (const u of unique) if (body[u] && db.prepare(`SELECT 1 FROM ${table} WHERE ${u} = ? AND id != ?`).get(body[u], rid)) throw conflict(`Ya existe un registro con ese ${u === 'code' ? 'código' : 'nombre'}.`);
-      db.prepare(`UPDATE ${table} SET ${cols.map((c) => `${c} = @${c}`).join(', ')}, updated_at = @ts WHERE id = @id`)
-        .run({ ...body, active: body.active ? 1 : 0, ts: now(), id: rid });
-      audit(req, 'editar', entity, rid, body);
-      return db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(rid);
+    const row = await txn(async () => {
+            if (!await db.get(`SELECT 1 FROM ${table} WHERE id = ?`, [rid])) throw notFound();
+      for (const u of unique) if (body[u] && await db.get(`SELECT 1 FROM ${table} WHERE ${u} = ? AND id != ?`, [body[u], rid])) throw conflict(`Ya existe un registro con ese ${u === 'code' ? 'código' : 'nombre'}.`);
+      await db.run(`UPDATE ${table} SET ${cols.map((c) => `${c} = @${c}`).join(', ')}, updated_at = @ts WHERE id = @id`, { ...body, active: body.active ? 1 : 0, ts: now(), id: rid });
+      await audit(req, 'editar', entity, rid, body);
+      return await db.get(`SELECT * FROM ${table} WHERE id = ?`, [rid]);
     });
     res.json(row);
   });
@@ -342,36 +332,34 @@ crud('articles', 'articulos', z.object({
   active: bool.default(true),
 }), 'admin.catalogo', { unique: ['code'] });
 
-admin.get('/catalogo', requirePerm('admin.catalogo'), (_req, res) => {
-  const db = getDb();
-  res.json({
-    categorias: db.prepare(`SELECT c.*, (SELECT COUNT(*) FROM articles a WHERE a.category_id = c.id) AS articulos FROM categories c ORDER BY c.name`).all(),
-    unidades: db.prepare('SELECT * FROM units ORDER BY name').all(),
-    articulos: db.prepare(`SELECT a.*, c.name AS category_name, u.name AS unit_name,
+admin.get('/catalogo', requirePerm('admin.catalogo'), async (_req, res) => {
+    res.json({
+    categorias: await db.all(`SELECT c.*, (SELECT COUNT(*) FROM articles a WHERE a.category_id = c.id) AS articulos FROM categories c ORDER BY c.name`),
+    unidades: await db.all('SELECT * FROM units ORDER BY name'),
+    articulos: await db.all(`SELECT a.*, c.name AS category_name, u.name AS unit_name,
       (SELECT COUNT(*) FROM requisition_items ri WHERE ri.article_id = a.id) AS usos
-      FROM articles a JOIN categories c ON c.id = a.category_id LEFT JOIN units u ON u.id = a.unit_id ORDER BY a.name`).all(),
+      FROM articles a JOIN categories c ON c.id = a.category_id LEFT JOIN units u ON u.id = a.unit_id ORDER BY a.name`),
   });
 });
 
 // ---------- Permisos por rol ----------
-admin.get('/permisos', requirePerm('admin.permisos'), (_req, res) => {
-  const rows = getDb().prepare('SELECT role, permission FROM role_permissions').all();
+admin.get('/permisos', requirePerm('admin.permisos'), async (_req, res) => {
+  const rows = await db.all('SELECT role, permission FROM role_permissions');
   const matrix = Object.fromEntries(Object.keys(ROLES).map((r) => [r, rows.filter((x) => x.role === r).map((x) => x.permission)]));
   res.json({ roles: ROLES, permisos: PERMISOS, matriz: matrix, bloqueados: { superadmin: PERMISOS_BLOQUEADOS_SUPERADMIN } });
 });
 
-admin.put('/permisos/:role', requirePerm('admin.permisos'), (req, res) => {
+admin.put('/permisos/:role', requirePerm('admin.permisos'), async (req, res) => {
   const role = parse(z.enum(Object.keys(ROLES)), req.params.role);
   const { permisos } = parse(z.object({ permisos: z.array(z.enum(Object.keys(PERMISOS))) }), req.body);
   const set = new Set(permisos);
   if (role === 'superadmin') PERMISOS_BLOQUEADOS_SUPERADMIN.forEach((p) => set.add(p));
-  txn(() => {
-    const db = getDb();
-    const before = db.prepare('SELECT permission FROM role_permissions WHERE role = ?').pluck().all(role);
-    db.prepare('DELETE FROM role_permissions WHERE role = ?').run(role);
-    const ins = db.prepare('INSERT INTO role_permissions (role, permission) VALUES (?, ?)');
-    for (const p of set) ins.run(role, p);
-    audit(req, 'editar', 'permisos', null, {
+  await txn(async () => {
+        const before = await db.column('SELECT permission FROM role_permissions WHERE role = ?', [role]);
+    await db.run('DELETE FROM role_permissions WHERE role = ?', [role]);
+    const ins = ((...a) => db.run('INSERT INTO role_permissions (role, permission) VALUES (?, ?)', a.length === 1 && typeof a[0] === "object" && !Array.isArray(a[0]) ? a[0] : a));
+    for (const p of set) await ins(role, p);
+    await audit(req, 'editar', 'permisos', null, {
       role, agregados: [...set].filter((p) => !before.includes(p)), retirados: before.filter((p) => !set.has(p)),
     });
   });
@@ -379,7 +367,7 @@ admin.put('/permisos/:role', requirePerm('admin.permisos'), (req, res) => {
 });
 
 // ---------- Auditoría ----------
-admin.get('/auditoria', requirePerm('admin.auditoria'), (req, res) => {
+admin.get('/auditoria', requirePerm('admin.auditoria'), async (req, res) => {
   const q = parse(z.object({
     usuario: optId.optional(), entidad: z.string().max(40).optional(), accion: z.string().max(40).optional(),
     desde: z.string().max(10).optional(), hasta: z.string().max(10).optional(),
@@ -392,15 +380,13 @@ admin.get('/auditoria', requirePerm('admin.auditoria'), (req, res) => {
   if (q.accion) { where.push('a.action = @a'); params.a = q.accion; }
   if (q.desde) { where.push('substr(a.created_at,1,10) >= @d'); params.d = q.desde; }
   if (q.hasta) { where.push('substr(a.created_at,1,10) <= @h'); params.h = q.hasta; }
-  const db = getDb();
-  const total = db.prepare(`SELECT COUNT(*) FROM audit_log a WHERE ${where.join(' AND ')}`).pluck().get(params);
-  const items = db.prepare(`SELECT a.*, u.first_name || ' ' || u.last_name AS user_name, u.username FROM audit_log a
-    LEFT JOIN users u ON u.id = a.user_id WHERE ${where.join(' AND ')} ORDER BY a.id DESC LIMIT 50 OFFSET @off`)
-    .all({ ...params, off: (q.pagina - 1) * 50 });
+    const total = await db.value(`SELECT COUNT(*) FROM audit_log a WHERE ${where.join(' AND ')}`, params);
+  const items = await db.all(`SELECT a.*, u.first_name || ' ' || u.last_name AS user_name, u.username FROM audit_log a
+    LEFT JOIN users u ON u.id = a.user_id WHERE ${where.join(' AND ')} ORDER BY a.id DESC LIMIT 50 OFFSET @off`, { ...params, off: (q.pagina - 1) * 50 });
   res.json({
     total, pagina: q.pagina, por_pagina: 50, items,
-    entidades: db.prepare('SELECT DISTINCT entity FROM audit_log ORDER BY entity').pluck().all(),
-    acciones: db.prepare('SELECT DISTINCT action FROM audit_log ORDER BY action').pluck().all(),
+    entidades: await db.column('SELECT DISTINCT entity FROM audit_log ORDER BY entity'),
+    acciones: await db.column('SELECT DISTINCT action FROM audit_log ORDER BY action'),
   });
 });
 
@@ -420,23 +406,22 @@ const settingsSchema = z.object({
   }
 });
 
-admin.get('/parametros', requirePerm('admin.parametros'), (_req, res) => res.json(getSettings()));
+admin.get('/parametros', requirePerm('admin.parametros'), async (_req, res) => res.json(await getSettings()));
 
-admin.put('/parametros', requirePerm('admin.parametros'), (req, res) => {
+admin.put('/parametros', requirePerm('admin.parametros'), async (req, res) => {
   const body = parse(settingsSchema, req.body);
-  txn(() => {
-    const db = getDb();
-    const before = getSettings();
-    const up = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+  await txn(async () => {
+        const before = await getSettings();
+    const up = ((...a) => db.run('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', a.length === 1 && typeof a[0] === "object" && !Array.isArray(a[0]) ? a[0] : a));
     const changes = {};
     for (const k of Object.keys(DEFAULT_SETTINGS)) {
       const v = String(body[k]).replace(/\s+/g, k === 'empresa_nombre' ? ' ' : '');
-      up.run(k, v);
+      await up(k, v);
       if (before[k] !== v) changes[k] = { antes: before[k], despues: v };
     }
-    audit(req, 'editar', 'parametros', null, changes);
+    await audit(req, 'editar', 'parametros', null, changes);
   });
-  res.json(getSettings());
+  res.json(await getSettings());
 });
 
 router.use('/admin', admin);

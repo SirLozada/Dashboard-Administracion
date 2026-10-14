@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { getDb, now } from './db.js';
+import { db, now } from './db.js';
 import { HttpError, forbidden } from './errors.js';
 import { getSetting } from './settings.js';
 import { PERMISOS_BLOQUEADOS_SUPERADMIN } from '../../shared/constants.js';
@@ -30,64 +30,62 @@ export function validatePasswordStrength(pw) {
 // ---------- Sesiones ----------
 export const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
-export function createSession(userId, req) {
+export async function createSession(userId, req) {
   const token = crypto.randomBytes(32).toString('base64url');
-  const hours = Number(getSetting('sesion_horas')) || 12;
+  const hours = Number(await getSetting('sesion_horas')) || 12;
   const expires = new Date(Date.now() + hours * 3600_000).toISOString();
-  getDb().prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at, ip, user_agent) VALUES (?,?,?,?,?,?)')
-    .run(sha256(token), userId, now(), expires, req.ip, String(req.get('user-agent') || '').slice(0, 300));
+  await db.run('INSERT INTO sessions (token_hash, user_id, created_at, expires_at, ip, user_agent) VALUES (?,?,?,?,?,?)',
+    [sha256(token), userId, now(), expires, req.ip, String(req.get('user-agent') || '').slice(0, 300)]);
   return { token, expires };
 }
 
-export function destroySession(token) {
-  if (token) getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+export async function destroySession(token) {
+  if (token) await db.run('DELETE FROM sessions WHERE token_hash = ?', [sha256(token)]);
 }
 
-export function destroyUserSessions(userId) {
-  getDb().prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+export async function destroyUserSessions(userId) {
+  await db.run('DELETE FROM sessions WHERE user_id = ?', [userId]);
 }
 
 export function cookieOptions(expires) {
   return {
     httpOnly: true,
     sameSite: 'strict',
-    secure: process.env.COOKIE_SECURE === 'true',
+    secure: process.env.COOKIE_SECURE === 'true' || !!process.env.VERCEL,
     path: '/',
     ...(expires ? { expires: new Date(expires) } : {}),
   };
 }
 
 // ---------- Permisos ----------
-export function permissionsFor(user) {
-  const db = getDb();
-  const set = new Set(db.prepare('SELECT permission FROM role_permissions WHERE role = ?').pluck().all(user.role));
-  for (const p of db.prepare('SELECT permission FROM user_permissions WHERE user_id = ?').pluck().all(user.id)) set.add(p);
+export async function permissionsFor(user) {
+  const set = new Set(await db.column('SELECT permission FROM role_permissions WHERE role = ?', [user.role]));
+  for (const p of await db.column('SELECT permission FROM user_permissions WHERE user_id = ?', [user.id])) set.add(p);
   if (user.role === 'superadmin') PERMISOS_BLOQUEADOS_SUPERADMIN.forEach((p) => set.add(p));
   return set;
 }
 
 export function loadUser(id) {
-  return getDb().prepare(`
+  return db.get(`
     SELECT u.id, u.username, u.email, u.first_name, u.last_name, u.position, u.department_id,
            u.role, u.active, u.must_change_password, d.name AS department_name
-    FROM users u LEFT JOIN departments d ON d.id = u.department_id WHERE u.id = ?`).get(id);
+    FROM users u LEFT JOIN departments d ON d.id = u.department_id WHERE u.id = ?`, [id]);
 }
 
 /** Middleware: adjunta req.user si la cookie de sesión es válida. */
-export function sessionMiddleware(req, _res, next) {
+export async function sessionMiddleware(req, _res, next) {
   const token = req.cookies?.[COOKIE];
   if (token) {
-    const db = getDb();
-    const s = db.prepare('SELECT user_id, expires_at FROM sessions WHERE token_hash = ?').get(sha256(token));
+    const s = await db.get('SELECT user_id, expires_at FROM sessions WHERE token_hash = ?', [sha256(token)]);
     if (s && s.expires_at > now()) {
-      const user = loadUser(s.user_id);
+      const user = await loadUser(s.user_id);
       if (user && user.active) {
-        user.permissions = permissionsFor(user);
+        user.permissions = await permissionsFor(user);
         req.user = user;
         req.sessionToken = token;
       }
     } else if (s) {
-      destroySession(token);
+      await destroySession(token);
     }
   }
   next();
@@ -125,20 +123,20 @@ export function publicUser(user) {
   };
 }
 
-// ---------- Limitador de intentos de inicio de sesión ----------
-const attempts = new Map();
+// ---------- Limitador de intentos de inicio de sesión (en BD: válido con varias instancias) ----------
 const WINDOW = 15 * 60_000;
 const MAX = 5;
 
-export function loginBlocked(key) {
-  const a = attempts.get(key);
+export async function loginBlocked(key) {
+  const a = await db.get('SELECT count, first_at FROM login_attempts WHERE key = ?', [key]);
   if (!a) return false;
-  if (Date.now() - a.first > WINDOW) { attempts.delete(key); return false; }
+  if (Date.now() - a.first_at > WINDOW) { await db.run('DELETE FROM login_attempts WHERE key = ?', [key]); return false; }
   return a.count >= MAX;
 }
-export function loginFailed(key) {
-  const a = attempts.get(key);
-  if (!a || Date.now() - a.first > WINDOW) attempts.set(key, { count: 1, first: Date.now() });
-  else a.count++;
+export async function loginFailed(key) {
+  await db.run(`INSERT INTO login_attempts (key, count, first_at) VALUES (?, 1, ?)
+    ON CONFLICT (key) DO UPDATE SET count = CASE WHEN ? - login_attempts.first_at > ? THEN 1 ELSE login_attempts.count + 1 END,
+    first_at = CASE WHEN ? - login_attempts.first_at > ? THEN EXCLUDED.first_at ELSE login_attempts.first_at END`,
+  [key, Date.now(), Date.now(), WINDOW, Date.now(), WINDOW]);
 }
-export const loginSucceeded = (key) => attempts.delete(key);
+export const loginSucceeded = (key) => db.run('DELETE FROM login_attempts WHERE key = ?', [key]);

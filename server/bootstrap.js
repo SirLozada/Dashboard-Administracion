@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { getDb, now } from './lib/db.js';
+import { db, initDb, now, tx } from './lib/db.js';
 import { hashPassword } from './lib/auth.js';
 import { PERMISOS_POR_DEFECTO } from '../shared/constants.js';
 
@@ -29,44 +29,100 @@ const CATALOGO = {
 };
 
 /** Inicializa los datos mínimos del sistema en el primer arranque. Idempotente. */
-export function bootstrap({ log = console.log } = {}) {
-  const db = getDb();
+export async function bootstrap({ log = console.log } = {}) {
+  await initDb();
   const ts = now();
-  db.transaction(() => {
-    if (!db.prepare('SELECT COUNT(*) FROM role_permissions').pluck().get()) {
-      const ins = db.prepare('INSERT INTO role_permissions (role, permission) VALUES (?, ?)');
-      for (const [role, perms] of Object.entries(PERMISOS_POR_DEFECTO)) perms.forEach((p) => ins.run(role, p));
-    }
-    if (!db.prepare('SELECT COUNT(*) FROM departments').pluck().get()) {
-      const ins = db.prepare('INSERT INTO departments (name, code, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)');
-      DEPARTAMENTOS.forEach(([n, c]) => ins.run(n, c, ts, ts));
-    }
-    if (!db.prepare('SELECT COUNT(*) FROM units').pluck().get()) {
-      const ins = db.prepare('INSERT INTO units (name, abbreviation, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)');
-      UNIDADES.forEach(([n, a]) => ins.run(n, a, ts, ts));
-    }
-    if (!db.prepare('SELECT COUNT(*) FROM categories').pluck().get()) {
-      const insC = db.prepare('INSERT INTO categories (name, description, active, created_at, updated_at) VALUES (?, \'\', 1, ?, ?)');
-      const insA = db.prepare(`INSERT INTO articles (code, name, category_id, unit_id, description, active, created_at, updated_at)
-        VALUES (?, ?, ?, (SELECT id FROM units WHERE name = ?), '', 1, ?, ?)`);
-      let n = 0;
-      for (const [cat, arts] of Object.entries(CATALOGO)) {
-        const cid = insC.run(cat, ts, ts).lastInsertRowid;
-        for (const [name, unit] of arts) insA.run(`ART-${String(++n).padStart(4, '0')}`, name, cid, unit, ts, ts);
+  await tx(async () => {
+    // Evita que dos instancias inicialicen a la vez (Vercel puede arrancar varias).
+    await db.get('SELECT pg_advisory_xact_lock(724502)');
+    if (!await db.value('SELECT COUNT(*) FROM role_permissions')) {
+      for (const [role, perms] of Object.entries(PERMISOS_POR_DEFECTO)) {
+        for (const p of perms) await db.run('INSERT INTO role_permissions (role, permission) VALUES (?, ?)', [role, p]);
       }
     }
-    if (!db.prepare('SELECT COUNT(*) FROM users').pluck().get()) {
+    if (!await db.value('SELECT COUNT(*) FROM departments')) {
+      for (const [n, c] of DEPARTAMENTOS) {
+        await db.run('INSERT INTO departments (name, code, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)', [n, c, ts, ts]);
+      }
+    }
+    if (!await db.value('SELECT COUNT(*) FROM units')) {
+      for (const [n, a] of UNIDADES) {
+        await db.run('INSERT INTO units (name, abbreviation, active, created_at, updated_at) VALUES (?, ?, 1, ?, ?)', [n, a, ts, ts]);
+      }
+    }
+    if (!await db.value('SELECT COUNT(*) FROM categories')) {
+      let n = 0;
+      for (const [cat, arts] of Object.entries(CATALOGO)) {
+        const { id: cid } = await db.run("INSERT INTO categories (name, description, active, created_at, updated_at) VALUES (?, '', 1, ?, ?) RETURNING id", [cat, ts, ts]);
+        for (const [name, unit] of arts) {
+          await db.run(`INSERT INTO articles (code, name, category_id, unit_id, description, active, created_at, updated_at)
+            VALUES (?, ?, ?, (SELECT id FROM units WHERE name = ?), '', 1, ?, ?)`, [`ART-${String(++n).padStart(4, '0')}`, name, cid, unit, ts, ts]);
+        }
+      }
+    }
+    if (!await db.value('SELECT COUNT(*) FROM users')) {
       const username = (process.env.ADMIN_USER || 'admin').toLowerCase();
       const generated = !process.env.ADMIN_PASSWORD;
       const password = process.env.ADMIN_PASSWORD || crypto.randomBytes(9).toString('base64url') + '9a';
-      db.prepare(`INSERT INTO users (username, email, first_name, last_name, position, department_id, role, active, password_hash,
+      await db.run(`INSERT INTO users (username, email, first_name, last_name, position, department_id, role, active, password_hash,
         must_change_password, created_at, updated_at) VALUES (?, ?, 'Superadministrador', 'del Sistema', 'Administrador del sistema',
-        (SELECT id FROM departments WHERE code = 'TI'), 'superadmin', 1, ?, 1, ?, ?)`)
-        .run(username, process.env.ADMIN_EMAIL || 'admin@herbaplant.local', hashPassword(password), ts, ts);
+        (SELECT id FROM departments WHERE code = 'TI'), 'superadmin', 1, ?, 1, ?, ?)`,
+      [username, process.env.ADMIN_EMAIL || 'admin@herbaplant.local', hashPassword(password), ts, ts]);
       log('──────────────────────────────────────────────────────────');
       log(` Superadministrador inicial creado: usuario "${username}"`);
       if (generated) log(` Contraseña temporal: ${password}  (se pedirá cambiarla)`);
       log('──────────────────────────────────────────────────────────');
     }
-  })();
+  });
+  if (process.env.SEED_DEMO === 'true') await seedDemo({ log: () => {} });
+}
+
+let ready;
+/** Garantiza (una vez por proceso) que la BD esté migrada e inicializada. */
+export function ensureReady() {
+  if (!ready) ready = bootstrap().catch((e) => { ready = undefined; throw e; });
+  return ready;
+}
+
+// ---------------------------------------------------------------------------
+// Datos de demostración (npm run seed:demo, o SEED_DEMO=true en Vercel)
+// ---------------------------------------------------------------------------
+
+const DEMO_USERS = [
+  ['gerente.produccion', 'María', 'González', 'Gerente de Producción', 'PRO', 'solicitante'],
+  ['subgerente.calidad', 'Luis', 'Pérez', 'Subgerente de Control de Calidad', 'CC', 'solicitante'],
+  ['gerente.mantenimiento', 'Carlos', 'Rodríguez', 'Gerente de Mantenimiento', 'MAN', 'solicitante'],
+  ['analista.compras', 'Ana', 'Martínez', 'Analista de Compras', 'COM', 'compras'],
+  ['jefe.compras', 'José', 'Hernández', 'Jefe de Compras', 'COM', 'compras'],
+  ['gerente.administracion', 'Carmen', 'López', 'Gerente de Administración', 'ADM', 'administracion'],
+  ['analista.administracion', 'Pedro', 'Díaz', 'Analista Administrativo', 'ADM', 'administracion'],
+];
+
+const DEMO_SUPPLIERS = [
+  ['Distribuidora Científica del Centro, C.A.', 'J-30123456-7', 'Rosa Medina', '0241-8123456', 'ventas@dicience.example'],
+  ['Papelería Universal, C.A.', 'J-29876543-1', 'Jorge Castillo', '0212-5551234', 'pedidos@papeluniversal.example'],
+  ['Químicos y Reactivos Venezuela, S.A.', 'J-31234567-0', 'Elena Rivas', '0243-2345678', 'info@quimirev.example'],
+  ['Empaques del Caribe, C.A.', 'J-40111222-3', 'Miguel Torres', '0241-8765432', 'comercial@empacaribe.example'],
+  ['Servicios Técnicos Integrales, C.A.', 'J-41222333-4', 'Andrés Mora', '0414-1234567', 'servicios@stisa.example'],
+];
+
+export async function seedDemo({ log = console.log } = {}) {
+  const password = process.env.DEMO_PASSWORD || 'Herbaplant2026';
+  const ts = now();
+  await tx(async () => {
+    await db.get('SELECT pg_advisory_xact_lock(724503)');
+    for (const [username, first, last, position, dept, role] of DEMO_USERS) {
+      if (await db.get('SELECT 1 FROM users WHERE username = ?', [username])) continue;
+      await db.run(`INSERT INTO users (username, email, first_name, last_name, position, department_id, role, active, password_hash,
+        must_change_password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, (SELECT id FROM departments WHERE code = ?), ?, 1, ?, 0, ?, ?)`,
+      [username, `${username}@herbaplant.example`, first, last, position, dept, role, hashPassword(password), ts, ts]);
+      log(`  usuario ${username.padEnd(26)} rol ${role}`);
+    }
+    for (const [name, taxId, contact, phone, email] of DEMO_SUPPLIERS) {
+      if (await db.get('SELECT 1 FROM suppliers WHERE name = ?', [name])) continue;
+      await db.run(`INSERT INTO suppliers (name, tax_id, contact_name, phone, email, address, active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, '', 1, ?, ?)`, [name, taxId, contact, phone, email, ts, ts]);
+    }
+  });
+  return password;
 }

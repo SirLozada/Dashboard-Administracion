@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
+import { useAuth } from '../auth.jsx';
 import { Icon } from './icons.jsx';
 import { fmtDateTime } from './ui.jsx';
 
@@ -12,20 +13,31 @@ export default function NotificationBell() {
   const [open, setOpen] = useState(false);
   const ref = useRef();
   const navigate = useNavigate();
+  const { config } = useAuth();
+  const realtime = config?.tiempo_real !== false;
+  const lastId = useRef(null);
 
-  const load = useCallback(() => api.get('/api/notificaciones?limite=12').then(setData).catch(() => {}), []);
+  const load = useCallback(() => api.get('/api/notificaciones?limite=12').then((d) => {
+    // Si llegó una notificación nueva, se avisa a las vistas abiertas para que se actualicen.
+    const newest = d.items[0]?.id ?? 0;
+    if (lastId.current !== null && newest > lastId.current) window.dispatchEvent(new Event(LIVE_EVENT));
+    lastId.current = newest;
+    setData(d);
+  }).catch(() => {}), []);
 
   useEffect(() => {
     load();
-    // Tiempo real por SSE; sondeo de respaldo cada 60 s por si la conexión se interrumpe.
+    // Tiempo real por SSE en servidor persistente; en Vercel se consulta cada 15 s.
     let es;
-    try {
-      es = new EventSource('/api/eventos');
-      es.addEventListener('notification', () => { load(); window.dispatchEvent(new Event(LIVE_EVENT)); });
-    } catch { /* navegador sin SSE */ }
-    const t = setInterval(load, 60_000);
+    if (realtime) {
+      try {
+        es = new EventSource('/api/eventos');
+        es.addEventListener('notification', load);
+      } catch { /* navegador sin SSE */ }
+    }
+    const t = setInterval(() => { if (document.visibilityState === 'visible') load(); }, realtime ? 60_000 : 15_000);
     return () => { clearInterval(t); es?.close(); };
-  }, [load]);
+  }, [load, realtime]);
 
   useEffect(() => {
     const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };

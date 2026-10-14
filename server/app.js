@@ -6,7 +6,7 @@ import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import { sessionMiddleware } from './lib/auth.js';
 import { HttpError } from './lib/errors.js';
-import { discardUpload } from './lib/files.js';
+import { ensureReady } from './bootstrap.js';
 import core from './modules/core/routes.js';
 import { MODULES } from './modules/index.js';
 
@@ -15,7 +15,7 @@ const CLIENT_DIST = path.resolve(__dirname, '../client/dist');
 
 export function createApp() {
   const app = express();
-  app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
+  app.set('trust proxy', process.env.TRUST_PROXY === 'true' || process.env.VERCEL ? 1 : false);
   app.disable('x-powered-by');
   app.use(helmet({
     contentSecurityPolicy: {
@@ -28,6 +28,8 @@ export function createApp() {
   }));
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
+  // Migraciones e inicialización perezosa (necesario en entornos sin servidor como Vercel).
+  app.use('/api', async (_req, _res, next) => { await ensureReady(); next(); });
   app.use('/api', sessionMiddleware);
 
   // Protección CSRF: toda petición que modifica datos debe venir de la aplicación (cabecera personalizada
@@ -51,16 +53,18 @@ export function createApp() {
 
   // Manejo centralizado de errores: mensajes claros y sin filtrar detalles internos.
   app.use((err, req, res, _next) => {
-    discardUpload(req.file);
     if (err instanceof HttpError) {
       return res.status(err.status).json({ error: err.message, details: err.details });
     }
     if (err?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Formato de datos inválido.' });
     if (err?.type === 'entity.too.large') return res.status(413).json({ error: 'La solicitud es demasiado grande.' });
-    if (String(err?.code).startsWith('SQLITE_CONSTRAINT')) {
+    // Violaciones de unicidad / integridad en Postgres (23xxx).
+    if (/^23/.test(String(err?.code))) {
       return res.status(409).json({ error: 'La operación entra en conflicto con datos existentes (posible duplicado).' });
     }
-    if (String(err?.code) === 'SQLITE_BUSY') return res.status(503).json({ error: 'El sistema está ocupado. Intente nuevamente en unos segundos.' });
+    if (['40001', '40P01', '57P01', 'ECONNREFUSED', 'ETIMEDOUT'].includes(String(err?.code))) {
+      return res.status(503).json({ error: 'El sistema está ocupado o sin conexión a la base de datos. Intente nuevamente en unos segundos.' });
+    }
     console.error(err);
     res.status(500).json({ error: 'Ocurrió un error inesperado. Intente nuevamente.' });
   });
