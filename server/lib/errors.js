@@ -20,3 +20,11 @@ export function parse(schema, data) {
   }
   return r.data;
 }
+
+/** Error de configuración del servidor: su mensaje es seguro y útil para mostrarlo al usuario. */
+export function configError(message) {
+  const e = new Error(message);
+  e.status = 503;
+  e.expose = true;
+  return e;
+}

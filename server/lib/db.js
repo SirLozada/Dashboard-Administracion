@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import fs from 'node:fs';
 import path from 'node:path';
 import { MIGRATIONS } from './schema.js';
+import { configError } from './errors.js';
 
 // Base de datos PostgreSQL:
 // - Producción / Vercel: servidor Postgres indicado en DATABASE_URL (p. ej. Neon).
@@ -48,7 +49,7 @@ async function createDriver() {
   }
 
   if (process.env.VERCEL) {
-    throw new Error('Falta la variable DATABASE_URL: conecte una base de datos Postgres (Neon) al proyecto en Vercel.');
+    throw configError('Falta la base de datos: en Vercel → Storage, conecte una base Neon (Postgres) al proyecto y vuelva a publicar (Redeploy).');
   }
   const { PGlite } = await import('@electric-sql/pglite');
   const { citext } = await import('@electric-sql/pglite/contrib/citext');
@@ -75,10 +76,27 @@ export function initDb() {
   if (!initPromise) {
     initPromise = (async () => {
       driver = await createDriver();
-      await migrate();
+      try {
+        await migrate();
+      } catch (e) {
+        if (e.expose) throw e;
+        console.error('Error al conectar o migrar la base de datos:', e);
+        throw configError(`No se pudo conectar con la base de datos (${e.code || e.message}). Verifique la conexión de Neon en Vercel → Storage.`);
+      }
     })().catch((e) => { initPromise = undefined; throw e; });
   }
   return initPromise;
+}
+
+/** Estado de la base de datos para el diagnóstico (/api/salud). */
+export async function dbStatus() {
+  try {
+    await initDb();
+    await query('SELECT 1');
+    return { ok: true, motor: DATABASE_URL ? 'postgres' : 'pglite' };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 export async function closeDb() {

@@ -7,6 +7,8 @@ import helmet from 'helmet';
 import { sessionMiddleware } from './lib/auth.js';
 import { HttpError } from './lib/errors.js';
 import { ensureReady } from './bootstrap.js';
+import { dbStatus } from './lib/db.js';
+import { storageStatus } from './lib/files.js';
 import core from './modules/core/routes.js';
 import { MODULES } from './modules/index.js';
 
@@ -29,6 +31,12 @@ export function createApp() {
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
   // Migraciones e inicialización perezosa (necesario en entornos sin servidor como Vercel).
+  app.get('/api/salud', async (_req, res) => {
+    const db = await dbStatus();
+    res.status(db.ok ? 200 : 503).json({
+      ok: db.ok, base_de_datos: db, archivos: storageStatus(), vercel: !!process.env.VERCEL, modulos: MODULES.map((m) => m.key),
+    });
+  });
   app.use('/api', async (_req, _res, next) => { await ensureReady(); next(); });
   app.use('/api', sessionMiddleware);
 
@@ -41,7 +49,6 @@ export function createApp() {
     next();
   });
 
-  app.get('/api/salud', (_req, res) => res.json({ ok: true, modulos: MODULES.map((m) => m.key) }));
   app.use('/api', core);
   for (const m of MODULES) m.mount(app);
   app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Recurso no encontrado.')));
@@ -56,6 +63,7 @@ export function createApp() {
     if (err instanceof HttpError) {
       return res.status(err.status).json({ error: err.message, details: err.details });
     }
+    if (err?.expose) return res.status(err.status || 503).json({ error: err.message });
     if (err?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Formato de datos inválido.' });
     if (err?.type === 'entity.too.large') return res.status(413).json({ error: 'La solicitud es demasiado grande.' });
     // Violaciones de unicidad / integridad en Postgres (23xxx).

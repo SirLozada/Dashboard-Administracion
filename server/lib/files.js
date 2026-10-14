@@ -4,7 +4,7 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import multer from 'multer';
 import { DATA_DIR, db, now } from './db.js';
-import { badRequest } from './errors.js';
+import { badRequest, configError } from './errors.js';
 import { maxUploadMb } from './settings.js';
 
 // Almacenamiento de adjuntos: Vercel Blob (privado) si hay token; si no, disco local en DATA_DIR/uploads.
@@ -38,10 +38,15 @@ export function discardUpload() {}
 async function writeBlob(name, buffer, mime) {
   if (USE_BLOB) {
     const { put } = await import('@vercel/blob');
-    const r = await put(`adjuntos/${name}`, buffer, { access: BLOB_ACCESS, contentType: mime, addRandomSuffix: true });
-    return r.pathname;
+    try {
+      const r = await put(`adjuntos/${name}`, buffer, { access: BLOB_ACCESS, contentType: mime, addRandomSuffix: true });
+      return r.pathname;
+    } catch (e) {
+      console.error('Error de Vercel Blob:', e);
+      throw configError(`No se pudo guardar el archivo en Vercel Blob (${e.message}). Si el almacén es público, agregue la variable BLOB_ACCESS=public.`);
+    }
   }
-  if (process.env.VERCEL) throw new Error('Falta BLOB_READ_WRITE_TOKEN: conecte un almacén Vercel Blob al proyecto.');
+  if (process.env.VERCEL) throw configError('Falta el almacén de archivos: en Vercel → Storage, conecte un Blob al proyecto y vuelva a publicar (Redeploy).');
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   fs.writeFileSync(path.join(UPLOAD_DIR, name), buffer);
   return name;
@@ -75,5 +80,7 @@ export async function storeUpload(file, { kind, requisitionId = null, userId }) 
     VALUES (?,?,?,?,?,?,?,?,?) RETURNING id`, [uuid, requisitionId, kind, name, stored, mime, file.size, userId, now()]);
   return { id: r.id, uuid, original_name: name, mime, size: file.size };
 }
+
+export const storageStatus = () => ({ blob: USE_BLOB, acceso: USE_BLOB ? BLOB_ACCESS : 'disco local' });
 
 export const FINANCE_KINDS = new Set(['cotizacion', 'factura', 'comprobante']);
